@@ -136,7 +136,7 @@ function humanRemaining(ms) {
 
 function buildPanelEmbed(slots) {
   const lines = [];
-  lines.push("📱 Sistem automatizat. Selectează un slot pentru rezervare.");
+  lines.push("📱 Selectează frigiderele pe care le folosesti.");
   lines.push("");
   lines.push("🧊 Status Frigidere");
   lines.push("");
@@ -168,13 +168,19 @@ function buildControlsRow() {
     .setLabel("Rezervă (8h)")
     .setStyle(ButtonStyle.Primary);
 
+  const releaseBtn = new ButtonBuilder()
+    .setCustomId("fridge_release")
+    .setLabel("Eliberează (al meu)")
+    .setStyle(ButtonStyle.Danger);
+
   const refreshBtn = new ButtonBuilder()
     .setCustomId("fridge_refresh")
     .setLabel("Refresh")
     .setStyle(ButtonStyle.Secondary);
 
-  return new ActionRowBuilder().addComponents(reserveBtn, refreshBtn);
+  return new ActionRowBuilder().addComponents(reserveBtn, releaseBtn, refreshBtn);
 }
+
 
 async function upsertPanelMessage() {
   const channel = await client.channels.fetch(PANEL_CHANNEL_ID).catch(() => null);
@@ -241,41 +247,66 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     // Buttons
-    if (interaction.isButton()) {
-      if (interaction.customId === "fridge_refresh") {
-        await upsertPanelMessage();
-        return interaction.reply({ content: "✅ Refresh făcut.", ephemeral: true });
-      }
+   // Buttons
+if (interaction.isButton()) {
+  if (interaction.customId === "fridge_refresh") {
+    // ✅ No alert message at all
+    await interaction.deferUpdate();
+    await upsertPanelMessage();
+    return;
+  }
 
-      if (interaction.customId === "fridge_reserve") {
-        await freeExpiredSlots();
-        const slots = await getSlots();
-        const freeSlots = slots.filter((s) => !s.reserved_by_id);
+  if (interaction.customId === "fridge_release") {
+    // ✅ No "Only you can see" spam: use deferReply + editReply
+    await interaction.deferReply({ ephemeral: true });
 
-        if (freeSlots.length === 0) {
-          return interaction.reply({ content: "❌ Nu există frigidere libere acum.", ephemeral: true });
-        }
+    await freeExpiredSlots();
+    const releasedSlot = await releaseUserSlot(interaction.user.id);
 
-        const menu = new StringSelectMenuBuilder()
-          .setCustomId("fridge_pick_slot")
-          .setPlaceholder("Alege un frigider liber…")
-          .addOptions(
-            freeSlots.slice(0, 25).map((s) => ({
-              label: `Frigider ${pad2(s.slot_no)}`,
-              value: String(s.slot_no),
-              description: `Rezervare pentru ${RESERVE_HOURS} ore`,
-            }))
-          );
-
-        const row = new ActionRowBuilder().addComponents(menu);
-
-        return interaction.reply({
-          content: "Selectează frigiderul pe care vrei să-l rezervi (8 ore):",
-          components: [row],
-          ephemeral: true,
-        });
-      }
+    if (!releasedSlot) {
+      await interaction.editReply("❌ Nu ai niciun frigider rezervat.");
+      return;
     }
+
+    await upsertPanelMessage();
+    await interaction.editReply(`✅ Ai eliberat frigiderul **${pad2(releasedSlot)}**.`);
+    return;
+  }
+
+  if (interaction.customId === "fridge_reserve") {
+    await freeExpiredSlots();
+    const slots = await getSlots();
+    const freeSlots = slots.filter((s) => !s.reserved_by_id);
+
+    if (freeSlots.length === 0) {
+      await interaction.reply({ content: "❌ Nu există frigidere libere acum.", ephemeral: true });
+      return;
+    }
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("fridge_pick_slot")
+      .setPlaceholder("Alege un frigider liber…")
+      .addOptions(
+        freeSlots.slice(0, 25).map((s) => ({
+          label: `Frigider ${pad2(s.slot_no)}`,
+          value: String(s.slot_no),
+          description: `Rezervare pentru ${RESERVE_HOURS} ore`,
+        }))
+      );
+
+    const row = new ActionRowBuilder().addComponents(menu);
+
+    // ✅ This message is ephemeral, but it's necessary for the dropdown.
+    // We'll keep it, but we can auto-clear it by editing it after selection (next step).
+    await interaction.reply({
+      content: "Selectează frigiderul pe care vrei să-l rezervi (8 ore):",
+      components: [row],
+      ephemeral: true,
+    });
+    return;
+  }
+}
+
 
     // Select menu: pick slot
     if (interaction.isStringSelectMenu() && interaction.customId === "fridge_pick_slot") {
