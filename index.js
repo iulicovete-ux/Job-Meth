@@ -113,6 +113,20 @@ async function reserveSlot(slotNo, userId, userName) {
 
   return r.rowCount === 1;
 }
+async function releaseUserSlot(userId) {
+  const r = await pool.query(
+    `
+    UPDATE fridge_slots
+    SET reserved_by_id=NULL, reserved_by_name=NULL, reserved_at=NULL, ends_at=NULL
+    WHERE reserved_by_id=$1
+    RETURNING slot_no
+    `,
+    [userId]
+  );
+
+  // returns slot number or null
+  return r.rows[0]?.slot_no ?? null;
+}
 
 // ====== DISCORD ======
 const client = new Client({
