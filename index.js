@@ -184,7 +184,7 @@ function buildPanelEmbed(slots) {
   }
 
   return new EmbedBuilder()
-    .setTitle("Garaj Operations Panel")
+    .setTitle("Garaj Procesare")
     .setDescription("```" + lines.join("\n") + "```");
 }
 
