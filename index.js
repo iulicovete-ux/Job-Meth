@@ -79,14 +79,9 @@ async function setMeta(key, value) {
   );
 }
 
-async function freeExpiredSlots() {
-  await pool.query(`
-    UPDATE fridge_slots
-    SET reserved_by_id=NULL, reserved_by_name=NULL, reserved_at=NULL, ends_at=NULL
-    WHERE ends_at IS NOT NULL AND ends_at <= NOW();
-  `);
-}
-
+// NOTE:
+// We NO LONGER auto-free expired slots.
+// The reservation stays until someone manually removes it.
 async function getSlots() {
   const r = await pool.query(`
     SELECT slot_no, reserved_by_id, reserved_by_name, reserved_at, ends_at
@@ -113,30 +108,29 @@ async function reserveSlot(slotNo, userId, userName) {
   return r.rowCount === 1;
 }
 
-// ✅ NEW: list only the slots reserved by this user
-async function getUserReservedSlots(userId) {
+// List ALL reserved slots
+async function getReservedSlots() {
   const r = await pool.query(
     `
-    SELECT slot_no, ends_at
+    SELECT slot_no, reserved_by_id, reserved_by_name, reserved_at, ends_at
     FROM fridge_slots
-    WHERE reserved_by_id=$1
+    WHERE reserved_by_id IS NOT NULL
     ORDER BY slot_no ASC
-    `,
-    [userId]
+    `
   );
   return r.rows;
 }
 
-// ✅ NEW: release only ONE specific slot, only if it's reserved by that user
-async function releaseSpecificSlot(slotNo, userId) {
+// Release ANY specific reserved slot
+async function releaseAnySpecificSlot(slotNo) {
   const r = await pool.query(
     `
     UPDATE fridge_slots
     SET reserved_by_id=NULL, reserved_by_name=NULL, reserved_at=NULL, ends_at=NULL
-    WHERE slot_no=$1 AND reserved_by_id=$2
+    WHERE slot_no=$1 AND reserved_by_id IS NOT NULL
     RETURNING slot_no
     `,
-    [slotNo, userId]
+    [slotNo]
   );
 
   return r.rows[0]?.slot_no ?? null;
@@ -152,7 +146,7 @@ function pad2(n) {
 }
 
 function humanRemaining(ms) {
-  if (ms <= 0) return "expirat";
+  if (ms <= 0) return "gata de eliberat";
   const totalMin = Math.floor(ms / 60_000);
   const h = Math.floor(totalMin / 60);
   const m = totalMin % 60;
@@ -173,12 +167,14 @@ function buildPanelEmbed(slots) {
 
   for (const s of slots) {
     const label = `[${pad2(s.slot_no)}]`;
-    if (!s.reserved_by_id || !s.ends_at) {
+
+    if (!s.reserved_by_id) {
       lines.push(`${label} 🟢 Liber`);
     } else {
-      const ends = new Date(s.ends_at).getTime();
-      const remaining = humanRemaining(ends - now);
-      const name = s.reserved_by_name ? s.reserved_by_name : "Necunoscut";
+      const ends = s.ends_at ? new Date(s.ends_at).getTime() : null;
+      const remaining = ends ? humanRemaining(ends - now) : "fără termen";
+      const name = s.reserved_by_name || "Necunoscut";
+
       lines.push(`${label} 🔴 ${name}  ⏳ ${remaining}`);
     }
   }
@@ -191,7 +187,7 @@ function buildPanelEmbed(slots) {
 function buildControlsRow() {
   const reserveBtn = new ButtonBuilder()
     .setCustomId("fridge_reserve")
-    .setLabel("Rezervă (8h)")
+    .setLabel(`Rezervă (${RESERVE_HOURS}h)`)
     .setStyle(ButtonStyle.Primary);
 
   const releaseBtn = new ButtonBuilder()
@@ -214,7 +210,6 @@ async function upsertPanelMessage() {
     return;
   }
 
-  await freeExpiredSlots();
   const slots = await getSlots();
   const embed = buildPanelEmbed(slots);
   const components = [buildControlsRow()];
@@ -274,21 +269,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // Buttons
     if (interaction.isButton()) {
-      // ✅ Refresh WITHOUT creating a new ephemeral message
+      // Refresh
       if (interaction.customId === "fridge_refresh") {
-        await interaction.deferUpdate(); // no popup message
+        await interaction.deferUpdate();
         await upsertPanelMessage();
         return;
       }
 
-      // ✅ Reserve: show dropdown (ephemeral) with free slots
+      // Reserve: show dropdown with free slots only
       if (interaction.customId === "fridge_reserve") {
-        await freeExpiredSlots();
         const slots = await getSlots();
         const freeSlots = slots.filter((s) => !s.reserved_by_id);
 
         if (freeSlots.length === 0) {
-          await interaction.reply({ content: "❌ Nu există frigidere libere acum.", ephemeral: true });
+          await interaction.reply({
+            content: "❌ Nu există frigidere libere acum.",
+            ephemeral: true,
+          });
           return;
         }
 
@@ -306,34 +303,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const row = new ActionRowBuilder().addComponents(menu);
 
         await interaction.reply({
-          content: "Selectează frigiderul pe care vrei să-l rezervi (8 ore):",
+          content: `Selectează frigiderul pe care vrei să-l rezervi (${RESERVE_HOURS} ore):`,
           components: [row],
           ephemeral: true,
         });
         return;
       }
 
-      // ✅ Release: show dropdown (ephemeral) with ONLY user's reserved slots
+      // Release: show dropdown with ALL reserved slots + reserver name
       if (interaction.customId === "fridge_release") {
         await interaction.deferReply({ ephemeral: true });
 
-        await freeExpiredSlots();
-        const mine = await getUserReservedSlots(interaction.user.id);
+        const reserved = await getReservedSlots();
 
-        if (mine.length === 0) {
-          await interaction.editReply("❌ Nu ai niciun frigider rezervat.");
+        if (reserved.length === 0) {
+          await interaction.editReply("❌ Nu există niciun frigider rezervat acum.");
           return;
         }
+
+        const now = Date.now();
 
         const menu = new StringSelectMenuBuilder()
           .setCustomId("fridge_release_pick")
           .setPlaceholder("Alege frigiderul pe care vrei să-l eliberezi…")
           .addOptions(
-            mine.slice(0, 25).map((s) => ({
-              label: `Frigider ${pad2(s.slot_no)}`,
-              value: String(s.slot_no),
-              description: "Eliberează acest frigider",
-            }))
+            reserved.slice(0, 25).map((s) => {
+              const name = s.reserved_by_name || "Necunoscut";
+              const ends = s.ends_at ? new Date(s.ends_at).getTime() : null;
+              const remaining = ends ? humanRemaining(ends - now) : "fără termen";
+
+              return {
+                label: `Frigider ${pad2(s.slot_no)} | ${name}`.slice(0, 100),
+                value: String(s.slot_no),
+                description: `${remaining}`.slice(0, 100),
+              };
+            })
           );
 
         const row = new ActionRowBuilder().addComponents(menu);
@@ -355,12 +359,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // ✅ ack without extra alerts
       await interaction.deferUpdate();
 
-      await freeExpiredSlots();
       const displayName = interaction.member?.displayName || interaction.user.username;
-
       const ok = await reserveSlot(slotNo, interaction.user.id, displayName);
 
       if (!ok) {
@@ -380,7 +381,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Select menu: release picked slot (ONLY that slot)
+    // Select menu: release picked slot (ANY reserved slot)
     if (interaction.isStringSelectMenu() && interaction.customId === "fridge_release_pick") {
       const slotNo = Number(interaction.values[0]);
 
@@ -391,12 +392,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.deferUpdate();
 
-      await freeExpiredSlots();
-      const released = await releaseSpecificSlot(slotNo, interaction.user.id);
+      const released = await releaseAnySpecificSlot(slotNo);
 
       if (!released) {
         await interaction.editReply({
-          content: `❌ Nu poți elibera frigiderul ${pad2(slotNo)} (nu este rezervat de tine sau e deja liber).`,
+          content: `❌ Frigiderul ${pad2(slotNo)} este deja liber sau nu mai poate fi eliberat.`,
           components: [],
         });
         return;
@@ -414,8 +414,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error("❌ Interaction error:", err);
     try {
       if (interaction.isRepliable()) {
-        // last resort
-        await interaction.reply({ content: "❌ A apărut o eroare.", ephemeral: true });
+        if (interaction.deferred || interaction.replied) {
+          await interaction.followUp({
+            content: "❌ A apărut o eroare.",
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({
+            content: "❌ A apărut o eroare.",
+            ephemeral: true,
+          });
+        }
       }
     } catch {}
   }
